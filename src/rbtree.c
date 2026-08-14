@@ -27,3 +27,65 @@ struct rbtree {
     size_t            size;       /* live node count; rb_size() returns this */
     rb_value_free_fn  value_free; /* NULL => values not owned */
 };
+
+/* M0 stubs for the public API. Each one returns the failure sentinel its
+ * header contract defines, so an unimplemented path can never be mistaken
+ * for a working one; they are replaced a function at a time. */
+
+rbtree_t *rb_create(rb_value_free_fn value_free) {
+    (void)value_free;
+    return NULL; /* M0 stub */
+}
+
+rbtree_t *rb_create_pooled(rb_value_free_fn value_free) {
+    (void)value_free;
+    return NULL; /* M0 stub */
+}
+
+int rb_insert(rbtree_t *t, const char *key, void *value) {
+    (void)t;
+    (void)key;
+    (void)value;
+    return -1; /* M0 stub: tree unchanged, value not consumed */
+}
+
+void *rb_find(const rbtree_t *t, const char *key) {
+    (void)t;
+    (void)key;
+    return NULL; /* M0 stub: absent */
+}
+
+int rb_delete(rbtree_t *t, const char *key) {
+    (void)t;
+    (void)key;
+    return -1; /* M0 stub: absent */
+}
+
+size_t rb_size(const rbtree_t *t) {
+    (void)t;
+    return 0; /* M0 stub */
+}
+
+void rb_foreach(const rbtree_t *t,
+                void (*fn)(const char *key, void *value, void *ctx),
+                void *ctx) {
+    (void)t;
+    (void)fn;
+    (void)ctx;
+    /* M0 stub: visits nothing */
+}
+
+int rb_validate(const rbtree_t *t) {
+    (void)t;
+    return -1; /* M0 stub: invariants not established */
+}
+
+void rb_destroy(rbtree_t *t) {
+    (void)t;
+    /* M0 stub: nothing allocated yet, so nothing to free */
+}
+
+rbtree_t *rb_snapshot(rbtree_t *t) {
+    (void)t;
+    return NULL; /* M0 stub */
+}
