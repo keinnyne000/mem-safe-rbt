@@ -5,6 +5,7 @@
 - Nothing is DONE until all three (make test, make asan, make memcheck) pass.
 ## Constraints
 - NEVER modify include/rbtree.h.
+- NEVER make a git commit.
 - All heap allocation in src/ goes through rb_malloc/rb_free
 (tests/fault_alloc.h). Direct malloc/free in src/ is a defect.
 - Any allocation may fail. Every failure path must unwind completely:
