@@ -1,10 +1,10 @@
-/* M0 unit tests: rb_create, rb_insert (BST descent, no red-black fixup),
- * rb_find, rb_destroy, with rb_size as a node-count oracle.
+/* Unit tests: rb_create, rb_insert (red-black, with fixup), rb_find,
+ * rb_destroy, with rb_size as a node-count oracle.
  *
  * Every assertion here is on behavior observable through the public API.
- * Nothing asserts tree shape, depth, or balance: M0 insert builds degenerate
- * spines by construction and M1 will rebalance them, so a shape assertion
- * would have to be rewritten or weakened later. */
+ * Shape and balance are asserted only through rb_validate, which reports
+ * whether the red-black invariants hold: struct rb_node is private to
+ * src/rbtree.c, so no assertion here depends on a particular tree layout. */
 
 /* Source-relative path: the build links every .c in one gcc invocation and
  * resolves -Iinclude against make's CWD, so do not depend on the search path. */
@@ -240,9 +240,10 @@ static void test_insert_increments_size(void) {
     rb_destroy(t);
 }
 
-/* Bulk insertion orders. M0 has no fixup, so ascending and descending runs
- * build fully degenerate spines; the cap keeps that depth well inside the
- * stack, since an M0 rb_destroy may still recurse (O(1) space is M3). */
+/* Bulk insertion orders. Ascending and descending runs are the orders a
+ * missing or broken fixup degenerates on, so each one validates after every
+ * single insert rather than only at the end: that pins down the insert that
+ * first broke an invariant instead of reporting the damage 500 keys later. */
 #define BULK_N 500
 
 enum insert_order { ORDER_ASCENDING, ORDER_DESCENDING, ORDER_SHUFFLED };
@@ -290,7 +291,13 @@ static void run_bulk_order(enum insert_order order) {
             CHECK(0, "bulk insert must grow size by exactly one per fresh key");
             goto done;
         }
+        if (rb_validate(t) != 0) {
+            CHECK(0, "red-black invariants must hold after every insert");
+            goto done;
+        }
     }
+
+    CHECK(rb_validate(t) == 0, "invariants must hold after a full bulk run");
 
     for (int i = 0; i < BULK_N; ++i) {
         char key[KEY_BUF];
@@ -339,6 +346,8 @@ static void test_overwrite_replaces_value(void) {
 
     CHECK(rb_size(t) == 1, "overwriting a key must not grow the tree");
     CHECK(rb_find(t, "dup") == second, "rb_find must return the newest value");
+    /* An overwrite links no node, so it must leave coloring untouched too. */
+    CHECK(rb_validate(t) == 0, "overwriting a key must leave invariants intact");
     CHECK(g_free_calls == 1, "overwrite must free exactly one old value");
     CHECK(g_freed_n == 1 && g_freed[0] == first,
           "overwrite must free the displaced value, not the new one");
@@ -374,6 +383,7 @@ static void test_overwrite_without_value_free(void) {
 
     CHECK(rb_size(t) == 1, "overwriting a key must not grow the tree");
     CHECK(rb_find(t, "dup") == second, "rb_find must return the newest value");
+    CHECK(rb_validate(t) == 0, "overwriting a key must leave invariants intact");
     /* The displaced value is still ours: reading it here is a use-after-free
      * report if the tree released it despite value_free being NULL. */
     CHECK(*first == 1, "with no value_free, the displaced value must not be freed");
@@ -606,6 +616,81 @@ done:
     rb_destroy(t);
 }
 
+/* ---- D. rb_validate ---------------------------------------------------- */
+
+/* rb_validate is the only window onto tree shape the public API offers, so the
+ * tests above lean on it heavily; these pin down its own edge cases first. */
+
+static void test_validate_empty_tree(void) {
+    rbtree_t *t = rb_create(count_free);
+    CHECK(t != NULL, "rb_create returned NULL");
+    if (!t)
+        return;
+
+    CHECK(rb_validate(t) == 0, "an empty tree must satisfy the invariants");
+
+    int *v = mkval(1);
+    if (!v)
+        goto done;
+    if (insert_owned(t, "only", v) != 0) {
+        CHECK(0, "rb_insert failed on a path that must succeed");
+        goto done;
+    }
+    /* A one-node tree is the smallest case that can get the root's color
+     * wrong: the node goes in red and must be recolored black. */
+    CHECK(rb_validate(t) == 0, "a single-node tree must satisfy the invariants");
+
+done:
+    rb_destroy(t);
+}
+
+/* Keys chosen so ordering decisions inside the fixup have to agree with the
+ * strcmp ordering the descent uses: an empty key that is a prefix of every
+ * other, keys differing only past a long common run, and bytes on both sides
+ * of the signed-char boundary. */
+static void test_validate_after_edge_keys(void) {
+    rbtree_t *t = rb_create(count_free);
+    CHECK(t != NULL, "rb_create returned NULL");
+    if (!t)
+        return;
+
+    static const char k80[] = {(char)0x80, '\0'};
+    static const char kff[] = {(char)0xff, '\0'};
+    static const char k01[] = {(char)0x01, '\0'};
+
+    const char *const keys[] = {
+        "", "a", k80, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", kff,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab", k01,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "ab", "b",
+    };
+    const int n = (int)(sizeof keys / sizeof keys[0]);
+
+    /* invariant: keys[0..i) are present and the tree is a valid red-black
+     * tree after each one of them individually */
+    for (int i = 0; i < n; ++i) {
+        int *v = mkval(i);
+        if (!v)
+            goto done;
+        if (insert_owned(t, keys[i], v) != 0) {
+            CHECK(0, "rb_insert failed on an edge-case key");
+            goto done;
+        }
+        if (rb_validate(t) != 0) {
+            CHECK(0, "invariants must hold after each edge-case key");
+            goto done;
+        }
+    }
+
+    CHECK(rb_size(t) == (size_t)n, "edge-case keys must all be distinct");
+    for (int i = 0; i < n; ++i) {
+        const int *v = rb_find(t, keys[i]);
+        CHECK(v != NULL && *v == i, "each edge-case key must resolve to its own value");
+    }
+
+done:
+    rb_destroy(t);
+}
+
 /* ---- runner ------------------------------------------------------------ */
 
 struct test_case {
@@ -634,6 +719,8 @@ static const struct test_case k_tests[] = {
     {"find_on_empty_tree", test_find_on_empty_tree},
     {"find_absent_keys", test_find_absent_keys},
     {"find_is_stable_and_const", test_find_is_stable_and_const},
+    {"validate_empty_tree", test_validate_empty_tree},
+    {"validate_after_edge_keys", test_validate_after_edge_keys},
 };
 
 int main(void) {
