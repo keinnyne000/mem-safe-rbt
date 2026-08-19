@@ -150,6 +150,131 @@ static void rb_insert_fixup(rbtree_t *t, struct rb_node *n) {
     t->root->color = RB_BLACK;
 }
 
+/* Deletion helpers. Like the rotations these are purely structural and
+ * allocate nothing, so rb_delete has no failure path to unwind. */
+
+/* A missing child is a black leaf. Routing every color test through one
+ * predicate keeps the fixup from spelling out the NULL case at each nephew,
+ * which is where a sentinel-free delete usually grows its NULL dereferences. */
+static bool is_black(const struct rb_node *n) {
+    return !n || n->color == RB_BLACK;
+}
+
+/* Leftmost node of the subtree rooted at n; for a right subtree that is the
+ * in-order successor of the node it hangs from. Precondition: n != NULL. */
+static struct rb_node *subtree_min(struct rb_node *n) {
+    /* invariant: the leftmost node of the original subtree lies at or below n */
+    while (n->left)
+        n = n->left;
+    return n;
+}
+
+/* Replaces the subtree rooted at u with the one rooted at v, which may be NULL.
+ * u's own child pointers are left alone: the caller either discards u or
+ * reassigns them. Only v's back-pointer is written, and only when v exists,
+ * since a NULL leaf has nowhere to record a parent -- that is exactly why
+ * rb_delete carries the displaced child's parent in a separate variable. */
+static void transplant(rbtree_t *t, struct rb_node *u, struct rb_node *v) {
+    if (!u->parent)
+        t->root = v;
+    else if (u == u->parent->left)
+        u->parent->left = v;
+    else
+        u->parent->right = v;
+
+    if (v)
+        v->parent = u->parent;
+}
+
+/* Restores the red-black invariants after a black node has left the tree. x is
+ * whatever moved into its place and may be NULL, so the parent is passed in
+ * rather than read back through x. Allocates nothing.
+ *
+ * "near" and "far" name the nephews relative to x: for a left child the near
+ * nephew is the sibling's left child, mirrored for a right child. */
+static void rb_delete_fixup(rbtree_t *t, struct rb_node *x,
+                            struct rb_node *parent) {
+    /* invariant: every path through x is one black short of what the rest of
+     * the tree requires, and x rises toward the root each iteration */
+    while (x != t->root && is_black(x)) {
+        if (x == parent->left) {
+            /* x's side is short a black while the sibling's side is not, so the
+             * sibling has a non-zero black-height and is a real node. */
+            struct rb_node *w = parent->right;
+
+            if (w->color == RB_RED) {
+                /* Recolor and rotate into the black-sibling cases; no path's
+                 * black count changes, so this is not progress by itself. */
+                w->color      = RB_BLACK;
+                parent->color = RB_RED;
+                rotate_left(t, parent);
+                w = parent->right;
+            }
+
+            if (is_black(w->left) && is_black(w->right)) {
+                /* Nothing to borrow: drop a black from the sibling too and let
+                 * the parent carry the deficit one level up. */
+                w->color = RB_RED;
+                x        = parent;
+                parent   = x->parent;
+            } else {
+                if (is_black(w->right)) {
+                    /* Only the near nephew is red; rotate it into the far
+                     * position so the case below applies. */
+                    if (w->left)
+                        w->left->color = RB_BLACK;
+                    w->color = RB_RED;
+                    rotate_right(t, w);
+                    w = parent->right;
+                }
+                /* The red far nephew pays for the missing black, which settles
+                 * the deficit outright. */
+                w->color      = parent->color;
+                parent->color = RB_BLACK;
+                if (w->right)
+                    w->right->color = RB_BLACK;
+                rotate_left(t, parent);
+                x = t->root;
+            }
+        } else {
+            struct rb_node *w = parent->left;
+
+            if (w->color == RB_RED) {
+                w->color      = RB_BLACK;
+                parent->color = RB_RED;
+                rotate_right(t, parent);
+                w = parent->left;
+            }
+
+            if (is_black(w->left) && is_black(w->right)) {
+                w->color = RB_RED;
+                x        = parent;
+                parent   = x->parent;
+            } else {
+                if (is_black(w->left)) {
+                    if (w->right)
+                        w->right->color = RB_BLACK;
+                    w->color = RB_RED;
+                    rotate_left(t, w);
+                    w = parent->left;
+                }
+                w->color      = parent->color;
+                parent->color = RB_BLACK;
+                if (w->left)
+                    w->left->color = RB_BLACK;
+                rotate_right(t, parent);
+                x = t->root;
+            }
+        }
+    }
+
+    /* x absorbs the outstanding black. A NULL x here means the loop never ran
+     * or a rotation already settled the deficit, and a NULL leaf is black
+     * regardless, so there is nothing to write. */
+    if (x)
+        x->color = RB_BLACK;
+}
+
 /* Remaining M0 stubs. Each one returns the failure sentinel its header
  * contract defines, so an unimplemented path can never be mistaken for a
  * working one; they are replaced a function at a time. */
@@ -237,10 +362,68 @@ void *rb_find(const rbtree_t *t, const char *key) {
     return n ? n->value : NULL;
 }
 
+/* BST removal, then rb_delete_fixup when the node that left was black. The
+ * successor is spliced into the victim's position rather than having its key
+ * and value copied over it: that keeps every key copy bound to the node that
+ * owns it, so a delete invalidates no node pointer but the one it removes.
+ * Nothing here allocates, so no failure can be raised at any point. */
 int rb_delete(rbtree_t *t, const char *key) {
-    (void)t;
-    (void)key;
-    return -1; /* M0 stub: absent */
+    struct rb_node *z = node_find(t->root, key);
+    if (!z)
+        return -1; /* nothing has been touched: the tree is exactly as it was */
+
+    /* x is whatever moves into the removed node's place and may be NULL, so its
+     * parent is tracked alongside it for the fixup. removed is the color that
+     * actually left the tree, which is the successor's when one is spliced in. */
+    struct rb_node *x;
+    struct rb_node *x_parent;
+    enum rb_color   removed = z->color;
+
+    if (!z->left) {
+        x        = z->right;
+        x_parent = z->parent;
+        transplant(t, z, z->right);
+    } else if (!z->right) {
+        x        = z->left;
+        x_parent = z->parent;
+        transplant(t, z, z->left);
+    } else {
+        /* The successor is the leftmost node of the right subtree, so it has no
+         * left child of its own and only its right child needs rehoming. */
+        struct rb_node *y = subtree_min(z->right);
+        removed = y->color;
+        x       = y->right;
+
+        if (y->parent == z) {
+            /* y stays where it is and keeps x as its right child. */
+            x_parent = y;
+        } else {
+            x_parent = y->parent; /* read before the transplant moves x up */
+            transplant(t, y, y->right);
+            y->right         = z->right;
+            y->right->parent = y;
+        }
+
+        transplant(t, z, y);
+        y->left         = z->left;
+        y->left->parent = y;
+        /* y takes over z's color, so the only blackness that can be missing is
+         * y's own former color, which is what removed already holds. */
+        y->color = z->color;
+    }
+
+    if (removed == RB_BLACK)
+        rb_delete_fixup(t, x, x_parent);
+
+    /* z is fully unlinked by now, so releasing it cannot leave the tree
+     * reaching into freed storage. Values are only ours to free when the tree
+     * owns them at all. */
+    if (t->value_free)
+        t->value_free(z->value);
+    rb_free(z->key);
+    rb_free(z);
+    --t->size;
+    return 0;
 }
 
 size_t rb_size(const rbtree_t *t) {

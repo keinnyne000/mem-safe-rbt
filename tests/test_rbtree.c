@@ -18,10 +18,16 @@
 
 static int         g_failures;
 static const char *g_current_test = "<none>";
+/* Names the table row a failure came from, or NULL outside a table-driven run. */
+static const char *g_current_case;
 
 static void report_failure(int line, const char *msg) {
     ++g_failures;
-    fprintf(stderr, "FAIL %s (line %d): %s\n", g_current_test, line, msg);
+    if (g_current_case)
+        fprintf(stderr, "FAIL %s[%s] (line %d): %s\n", g_current_test, g_current_case, line,
+                msg);
+    else
+        fprintf(stderr, "FAIL %s (line %d): %s\n", g_current_test, line, msg);
 }
 
 /* Records the failure and keeps going, so one run reports every broken case
@@ -691,6 +697,336 @@ done:
     rb_destroy(t);
 }
 
+/* ---- E. rb_delete ------------------------------------------------------ */
+
+/* struct rb_node is private to src/rbtree.c, so nothing here can read a node's
+ * color. Each case names an insert order instead, and the comment above it
+ * draws the tree that order produces, so the configuration rb_delete faces is
+ * on the record even though the test cannot see it. Every diagram was taken
+ * from the real insert path rather than derived by hand; a child that is not
+ * drawn is a NULL (black) leaf.
+ *
+ * "near" and "far" name the deleted node's nephews relative to itself: for a
+ * left child the near nephew is the sibling's left child, mirrored for a right
+ * child. Both orientations of every configuration appear, because a fixup that
+ * handles one side and mirrors it wrongly still passes the one-sided half. */
+
+struct delete_case {
+    const char        *name;
+    const char *const *inserts; /* NULL-terminated, in insert order */
+    const char        *victim;
+    int                expect_rc;
+};
+
+/*      b(B)
+ *     /    \
+ *   a(R)   c(R)          Red leaves on both sides, and the smallest root with
+ *                        two children, whose successor is its own right child.
+ */
+static const char *const dc_three_node[] = {"b", "a", "c", NULL};
+
+/*        d(B)
+ *       /    \
+ *    b(B)    f(R)        the sixth key recolors f red through the red-uncle
+ *           /    \       branch of the insert fixup, which is the only way an
+ *        e(B)    g(B)    insert-only sequence reaches a red sibling.
+ *            \
+ *           ee(R)
+ */
+static const char *const dc_red_sibling_right[] = {"d", "b", "f", "e", "g", "ee", NULL};
+
+/*          d(B)
+ *         /    \
+ *      b(R)    f(B)      mirror of dc_red_sibling_right.
+ *     /    \
+ *  a(B)    c(B)
+ *      \
+ *     aa(R)
+ */
+static const char *const dc_red_sibling_left[] = {"d", "f", "b", "c", "a", "aa", NULL};
+
+/* m(B) alone: deleting it must empty the tree, not merely unlink it. */
+static const char *const dc_sole_node[] = {"m", NULL};
+
+/*    b(B)
+ *   /                    root with one child; the child must become the new
+ * a(R)                   black root.
+ */
+static const char *const dc_root_one_child_left[] = {"b", "a", NULL};
+
+/* a(B)
+ *     \                  mirror of dc_root_one_child_left.
+ *     b(R)
+ */
+static const char *const dc_root_one_child_right[] = {"a", "b", NULL};
+
+/*          d(B)
+ *        /      \
+ *     b(B)      f(B)     every internal node has two children, so this one tree
+ *    /    \    /    \    covers a left child, a right child, and a root whose
+ * a(R)  c(R) e(R)  g(R)  successor is a grandchild rather than its right child.
+ */
+static const char *const dc_perfect[] = {"d", "b", "f", "a", "c", "e", "g", NULL};
+
+/*    d(B)
+ *   /    \                black sibling with a red far nephew and a nil near
+ * b(B)   f(B)             nephew: the rotate-once case, and the near nephew is
+ *            \            black so an implementation that tests the wrong
+ *            g(R)         nephew cannot pass by accident.
+ */
+static const char *const dc_far_nephew_right[] = {"d", "b", "f", "g", NULL};
+
+/*      d(B)
+ *     /    \              mirror of dc_far_nephew_right.
+ *  b(B)    f(B)
+ *  /
+ * a(R)
+ */
+static const char *const dc_far_nephew_left[] = {"d", "f", "b", "a", NULL};
+
+/*    d(B)
+ *   /    \                black sibling with a red near nephew and a nil far
+ * b(B)   f(B)             nephew: the case that must rotate the sibling first
+ *        /                and only then rotate the parent.
+ *      e(R)
+ */
+static const char *const dc_near_nephew_right[] = {"d", "b", "f", "e", NULL};
+
+/*      d(B)
+ *     /    \              mirror of dc_near_nephew_right.
+ *  b(B)    f(B)
+ *      \
+ *      c(R)
+ */
+static const char *const dc_near_nephew_left[] = {"d", "f", "b", "c", NULL};
+
+/*            d(B)
+ *          /      \
+ *       b(R)      f(R)        a and c are black leaves that are each other's
+ *      /    \    /    \       sibling, so both nephews are nil: the recoloring
+ *   a(B)  c(B) e(B)  g(B)     case. Their parent b is red, so the fixup absorbs
+ *                       \     the extra black there and stops immediately.
+ *                       h(R)
+ */
+static const char *const dc_black_nephews_red_parent[] = {"a", "b", "c", "d", "e",
+                                                          "f", "g", "h", NULL};
+
+/*            d(B)
+ *          /      \
+ *       b(B)      f(B)        same recoloring case, but b is black, so the
+ *      /    \    /    \       extra black cannot stop there and must climb to
+ *   a(B)  c(B) e(B)  h(R)     b, where the sibling f is black with a red far
+ *                  /    \     nephew. One delete therefore runs two fixup
+ *               g(B)    i(B)  iterations.
+ *                          \
+ *                          j(R)
+ */
+static const char *const dc_black_nephews_climb[] = {"a", "b", "c", "d", "e",
+                                                     "f", "g", "h", "i", "j", NULL};
+
+/* No keys at all: rb_delete must report absence rather than dereference a NULL
+ * root. */
+static const char *const dc_empty[] = {NULL};
+
+/* Keys where one is a strict prefix of another, so an absent key can still walk
+ * a full root-to-leaf path before failing. */
+static const char *const dc_prefix[] = {"ab", "abc", "m", NULL};
+
+static const struct delete_case k_delete_cases[] = {
+    /* red leaf */
+    {"red_leaf_left", dc_three_node, "a", 0},
+    {"red_leaf_right", dc_three_node, "c", 0},
+
+    /* black leaf whose sibling is red */
+    {"red_sibling_right", dc_red_sibling_right, "b", 0},
+    {"red_sibling_left", dc_red_sibling_left, "f", 0},
+
+    /* the root itself */
+    {"root_sole_node", dc_sole_node, "m", 0},
+    {"root_one_child_left", dc_root_one_child_left, "b", 0},
+    {"root_one_child_right", dc_root_one_child_right, "a", 0},
+    {"root_two_children", dc_three_node, "b", 0},
+
+    /* both children present */
+    {"two_children_left_child", dc_perfect, "b", 0},
+    {"two_children_right_child", dc_perfect, "f", 0},
+    {"two_children_deeper_successor", dc_perfect, "d", 0},
+
+    /* black leaf whose sibling is black */
+    {"black_sibling_far_nephew_right", dc_far_nephew_right, "b", 0},
+    {"black_sibling_far_nephew_left", dc_far_nephew_left, "f", 0},
+    {"black_sibling_near_nephew_right", dc_near_nephew_right, "b", 0},
+    {"black_sibling_near_nephew_left", dc_near_nephew_left, "f", 0},
+    {"black_nephews_red_parent_left", dc_black_nephews_red_parent, "a", 0},
+    {"black_nephews_red_parent_right", dc_black_nephews_red_parent, "c", 0},
+    {"black_nephews_climb_left", dc_black_nephews_climb, "a", 0},
+    {"black_nephews_climb_right", dc_black_nephews_climb, "c", 0},
+
+    /* absent keys: the tree must come through untouched */
+    {"absent_from_empty_tree", dc_empty, "anything", -1},
+    {"absent_key_after_every_node", dc_perfect, "zzz", -1},
+    {"absent_key_is_a_prefix", dc_prefix, "a", -1},
+};
+
+/* Builds the case's tree, deletes one key, and checks every post-condition the
+ * header fixes: the return code, the size, the victim's absence, which value was
+ * released, the red-black invariants, and the survival of every other key. */
+static void run_delete_case(const struct delete_case *c) {
+    int before = g_failures;
+
+    g_current_case = c->name;
+    reset_free_log();
+
+    rbtree_t *t = rb_create(count_free);
+    CHECK(t != NULL, "rb_create returned NULL");
+    if (!t)
+        goto done;
+
+    /* invariant: inserts[0..i) are present, each mapped to its own index, and
+     * the tree is a valid red-black tree after every one of them; a failure
+     * here is a broken case setup, not a defect in rb_delete */
+    int i = 0;
+    for (; c->inserts[i]; ++i) {
+        int *v = mkval(i);
+        if (!v)
+            goto cleanup;
+        if (insert_owned(t, c->inserts[i], v) != 0) {
+            CHECK(0, "case setup: rb_insert failed on a fresh key");
+            goto cleanup;
+        }
+        if (rb_validate(t) != 0) {
+            CHECK(0, "case setup: the insert order must build a valid tree");
+            goto cleanup;
+        }
+    }
+    const int n = i;
+    if (rb_size(t) != (size_t)n) {
+        CHECK(0, "case setup: the keys of a case must all be distinct");
+        goto cleanup;
+    }
+
+    void *victim_value = rb_find(t, c->victim);
+    CHECK((victim_value != NULL) == (c->expect_rc == 0),
+          "case setup: a case must expect 0 exactly when its victim is present");
+
+    int rc = rb_delete(t, c->victim);
+    CHECK(rc == c->expect_rc, "rb_delete returned the wrong code");
+
+    if (c->expect_rc == 0) {
+        CHECK(rb_size(t) == (size_t)n - 1, "a successful delete must shrink size by exactly one");
+        CHECK(rb_find(t, c->victim) == NULL, "a deleted key must no longer be findable");
+        CHECK(g_free_calls == 1, "a successful delete must free exactly one value");
+        CHECK(g_freed_n == 1 && g_freed[0] == victim_value,
+              "a successful delete must free the deleted key's value and no other");
+    } else {
+        CHECK(rb_size(t) == (size_t)n, "a failed delete must leave size unchanged");
+        CHECK(g_free_calls == 0, "a failed delete must free no value");
+    }
+
+    CHECK(rb_validate(t) == 0, "the invariants must hold after rb_delete");
+
+    /* invariant: every key but the victim still resolves to the value it was
+     * inserted with, which catches a delete that reorders the tree or moves a
+     * value onto the wrong key -- neither of which rb_validate can see */
+    for (i = 0; i < n; ++i) {
+        if (c->expect_rc == 0 && strcmp(c->inserts[i], c->victim) == 0)
+            continue;
+        const int *v = rb_find(t, c->inserts[i]);
+        if (v == NULL || *v != i) {
+            CHECK(0, "every surviving key must still resolve to its own value");
+            break;
+        }
+    }
+
+cleanup:
+    rb_destroy(t);
+done:
+    if (g_failures == before)
+        printf("ok   delete/%s\n", c->name);
+    g_current_case = NULL;
+}
+
+static void test_delete_table(void) {
+    const size_t n = sizeof k_delete_cases / sizeof k_delete_cases[0];
+    /* invariant: cases 0..i have each run against their own fresh tree */
+    for (size_t i = 0; i < n; ++i)
+        run_delete_case(&k_delete_cases[i]);
+}
+
+/* The header gives rb_delete the value as well as the key copy, but only when
+ * the tree owns values at all. */
+static void test_delete_without_value_free(void) {
+    rbtree_t *t = rb_create(NULL); /* value_free NULL => values not owned */
+    CHECK(t != NULL, "rb_create returned NULL");
+    if (!t)
+        return;
+
+    int *v = mkval(5);
+    if (!v)
+        goto done;
+    if (insert_owned(t, "solo", v) != 0) {
+        CHECK(0, "rb_insert failed on a path that must succeed");
+        v = NULL;
+        goto done;
+    }
+
+    CHECK(rb_delete(t, "solo") == 0, "deleting a present key must return 0");
+    CHECK(rb_size(t) == 0, "deleting the only key must empty the tree");
+    CHECK(rb_validate(t) == 0, "an emptied tree must satisfy the invariants");
+    /* The value is still ours: reading it here is a use-after-free report, and
+     * the free below a double free, if rb_delete released what it does not own. */
+    CHECK(*v == 5, "with no value_free, a deleted value must survive");
+
+done:
+    rb_destroy(t);
+    free(v);
+}
+
+/* A delete that leaves the key copy reachable, or a stale parent pointer behind,
+ * shows up on the next insert rather than at the delete itself. */
+static void test_delete_then_reinsert(void) {
+    rbtree_t *t = rb_create(count_free);
+    CHECK(t != NULL, "rb_create returned NULL");
+    if (!t)
+        return;
+
+    int i = 0;
+    /* invariant: dc_perfect[0..i) are present, each mapped to its own index */
+    for (; dc_perfect[i]; ++i) {
+        int *v = mkval(i);
+        if (!v)
+            goto done;
+        if (insert_owned(t, dc_perfect[i], v) != 0) {
+            CHECK(0, "rb_insert failed on a fresh key");
+            goto done;
+        }
+    }
+    const int n = i;
+
+    CHECK(rb_delete(t, "b") == 0, "deleting a present key must return 0");
+    CHECK(rb_size(t) == (size_t)n - 1, "a successful delete must shrink size by one");
+    CHECK(rb_find(t, "b") == NULL, "a deleted key must no longer be findable");
+    CHECK(rb_validate(t) == 0, "the invariants must hold after rb_delete");
+
+    int *again = mkval(99);
+    if (!again)
+        goto done;
+    if (insert_owned(t, "b", again) != 0) {
+        CHECK(0, "reinserting a deleted key must succeed");
+        goto done;
+    }
+
+    CHECK(rb_size(t) == (size_t)n, "reinserting a deleted key must restore the size");
+    CHECK(rb_find(t, "b") == again, "a reinserted key must resolve to its new value");
+    CHECK(rb_validate(t) == 0, "the invariants must hold after a delete and reinsert");
+    /* One value was displaced by the delete and none by the reinsert, since the
+     * key was genuinely gone rather than merely unreachable. */
+    CHECK(g_free_calls == 1, "delete then reinsert must free exactly the deleted value");
+
+done:
+    rb_destroy(t);
+}
+
 /* ---- runner ------------------------------------------------------------ */
 
 struct test_case {
@@ -721,6 +1057,9 @@ static const struct test_case k_tests[] = {
     {"find_is_stable_and_const", test_find_is_stable_and_const},
     {"validate_empty_tree", test_validate_empty_tree},
     {"validate_after_edge_keys", test_validate_after_edge_keys},
+    {"delete_table", test_delete_table},
+    {"delete_without_value_free", test_delete_without_value_free},
+    {"delete_then_reinsert", test_delete_then_reinsert},
 };
 
 int main(void) {
