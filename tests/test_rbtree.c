@@ -400,6 +400,43 @@ done:
     free(second);
 }
 
+/* Re-inserting the pointer the tree already holds, under its own key. rb_insert
+ * takes the overwrite path, and the value it would free is the value it is about
+ * to store: freeing it would leave the tree holding a dangling pointer that the
+ * very next rb_find hands back. Nothing else in the suite reaches that branch --
+ * every other test, and the fuzzer, supplies a freshly allocated value, which can
+ * never equal a pointer the tree is still holding. */
+static void test_reinsert_same_value_frees_nothing(void) {
+    rbtree_t *t = rb_create(count_free);
+    CHECK(t != NULL, "rb_create returned NULL");
+    if (!t)
+        return;
+
+    int *v = mkval(7);
+    if (!v)
+        goto done;
+    if (insert_owned(t, "dup", v) != 0) {
+        CHECK(0, "rb_insert failed on a path that must succeed");
+        goto done;
+    }
+
+    /* Deliberately not insert_owned: the tree already owns v, so releasing it on
+     * a reported failure would be a double free rather than a cleanup. */
+    int rc = rb_insert(t, "dup", v);
+    CHECK(rc == 0, "re-inserting the stored value under its own key must return 0");
+    CHECK(g_free_calls == 0, "re-inserting the stored value must free nothing");
+
+    /* Reading through v is the assertion that matters: if the tree released it,
+     * this is a use-after-free for ASan and Valgrind to report. */
+    CHECK(*v == 7, "the re-inserted value must still be readable");
+    CHECK(rb_find(t, "dup") == v, "rb_find must still return the re-inserted value");
+    CHECK(rb_size(t) == 1, "re-inserting a stored value must not grow the tree");
+    CHECK(rb_validate(t) == 0, "re-inserting a stored value must leave invariants intact");
+
+done:
+    rb_destroy(t);
+}
+
 static void test_insert_copies_key(void) {
     rbtree_t *t = rb_create(count_free);
     CHECK(t != NULL, "rb_create returned NULL");
@@ -1048,6 +1085,7 @@ static const struct test_case k_tests[] = {
     {"insert_shuffled", test_insert_shuffled},
     {"overwrite_replaces_value", test_overwrite_replaces_value},
     {"overwrite_without_value_free", test_overwrite_without_value_free},
+    {"reinsert_same_value_frees_nothing", test_reinsert_same_value_frees_nothing},
     {"insert_copies_key", test_insert_copies_key},
     {"key_edge_cases", test_key_edge_cases},
     {"keys_sharing_a_prefix", test_keys_sharing_a_prefix},
